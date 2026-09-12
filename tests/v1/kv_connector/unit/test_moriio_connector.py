@@ -3,6 +3,8 @@
 import importlib.util
 import socket
 import uuid
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import msgspec
@@ -20,11 +22,13 @@ from vllm.config import (
     set_current_vllm_config,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
+    ROLE,
     MoRIIOAgentMetadata,
     MoRIIOConnectorMetadata,
     MoRIIOConstants,
     MoRIIOMode,
     resolve_host_ip,
+    set_role,
     zmq_ctx,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import (
@@ -43,6 +47,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
+    compute_layer_kv_cache_shape_bytes,
 )
 
 from .utils import create_request, create_scheduler
@@ -56,20 +61,25 @@ def _find_free_port() -> int:
 
 def _make_test_kv_cache_config() -> KVCacheConfig:
     layer_names = ["layer0", "layer1", "layer2"]
+    num_blocks = 2
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=4,
+        head_size=64,
+        dtype=torch.float16,
+    )
+    page = spec.page_size_bytes
     return KVCacheConfig(
-        num_blocks=2,
-        kv_cache_tensors=[KVCacheTensor(size=0, shared_by=layer_names)],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                layer_names=layer_names,
-                kv_cache_spec=FullAttentionSpec(
-                    block_size=16,
-                    num_kv_heads=4,
-                    head_size=64,
-                    dtype=torch.float16,
-                ),
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=len(layer_names) * num_blocks * page,
+                layers=layer_names,
+                layer_stride=num_blocks * page,
+                block_stride=page,
             )
         ],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)],
     )
 
 
@@ -137,6 +147,52 @@ def _write_consumer_scheduler_for_finished_request(tp_size: int = 2):
     scheduler._reqs_need_recv = {}
     scheduler.unmap_request_id = MagicMock()
     return scheduler
+
+
+def _write_producer_scheduler(block_size: int = 1) -> Any:
+    """Bare WRITE-mode PRODUCER MoRIIOConnectorScheduler for save-path tests.
+
+    Constructed via ``__new__`` (like ``_write_consumer_scheduler_for_finished_request``
+    above) so the save path (``build_connector_meta`` -> ``_clamp_to_prompt_blocks``)
+    can be exercised without a real engine/RDMA stack. Only the attributes touched
+    by that path are populated. The prompt-block clamp is derived purely from
+    ``req.num_prompt_tokens`` and ``block_size`` (no speculative-token field), so
+    it is correct for any block size.
+    """
+    scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
+    scheduler.mode = MoRIIOMode.WRITE
+    scheduler.is_producer = True
+    scheduler.block_size = block_size
+    scheduler.transfer_id_to_request_id = {}
+    scheduler._reqs_need_recv = {}
+    scheduler._reqs_need_save = {}
+    scheduler._reqs_need_pending_save = {}
+    scheduler._req_kv_params = {}
+    scheduler._reqs_need_send = {}
+    return scheduler
+
+
+def _spec_kv_params(transfer_id: str = "xfer-spec") -> dict[str, Any]:
+    # Sidecar-style params: request_id embeds no zmq address, so add_new_req
+    # resolves the peer from these explicit fields.
+    return {
+        "transfer_id": transfer_id,
+        "remote_engine_id": "remote-engine",
+        "remote_block_ids": [],
+        "remote_host": "127.0.0.1",
+        "remote_handshake_port": 5000,
+        "remote_notify_port": 5001,
+    }
+
+
+def _build_meta(scheduler: Any, req_ids=None, new_block_ids=None) -> Any:
+    scheduler_output = SimpleNamespace(
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=req_ids or [],
+            new_block_ids=new_block_ids or [],
+        )
+    )
+    return scheduler.build_connector_meta(scheduler_output)
 
 
 class FakeMoRIIOWrapper:
@@ -225,7 +281,7 @@ class FakeMoRIIOConnectorWorker(MoRIIOConnectorWorker):
         engine_id,
         *args,
         hand_shake_latency: float = 1.8,
-        kv_cache_layout="HND",
+        kv_cache_layout="LBHNC",
         kv_cache_config=None,
         **kwargs,
     ):
@@ -508,9 +564,15 @@ def test_send_transfer_release_sends_structured_release_message():
     scheduler._send_transfer_release("xfer-7", "127.0.0.1", 7000)
 
     payload = sock.send.call_args.args[0]
+    # WRITE-mode release advertises the consumer (decode) TP size so the prefill
+    # side counts the right number of ACKs via get_moriio_expected_ack_count,
+    # mirroring the READ-mode release in _pop_done_transfers (see
+    # test_read_completion_sends_structured_release_with_consumer_tp_size). The
+    # fixture's tp_size is 2, so consumer_tp_size == 2.
     assert msgspec.msgpack.decode(payload) == {
         "type": "release",
         "transfer_id": "xfer-7",
+        "consumer_tp_size": 2,
     }
 
 
@@ -525,16 +587,15 @@ def test_register_kv_caches(mock_parallel_groups):
     DEFAULT_PORT = 6301
     TP_RANK = 0
     DP_RANK = 0
-    from vllm.v1.attention.backends.rocm_aiter_fa import AiterFlashAttentionBackend
-
-    backend_cls = AiterFlashAttentionBackend
-
-    # Create test kv cache tensors using proper backend shape
-    kv_cache_shape = backend_cls.get_kv_cache_shape(
-        num_blocks=2, block_size=16, num_kv_heads=4, head_size=64
+    # Create test kv cache tensors using KVCacheSpec layout
+    shape = compute_layer_kv_cache_shape_bytes(
+        FullAttentionSpec(
+            block_size=16, num_kv_heads=4, head_size=64, dtype=torch.float16
+        ),
+        2,
     )
-    shared_tensor = torch.zeros(*kv_cache_shape, dtype=torch.float16)
-    unique_tensor = torch.zeros(*kv_cache_shape, dtype=torch.float16)
+    shared_tensor = torch.zeros(*shape, dtype=torch.int8).view(torch.float16)
+    unique_tensor = torch.zeros(*shape, dtype=torch.int8).view(torch.float16)
     kv_caches = {
         "layer0": shared_tensor,
         "layer1": unique_tensor,
@@ -621,16 +682,15 @@ def test_moriio_handshake_returns_metadata(mock_parallel_groups):
 
     ROLE = "kv_consumer"
     vllm_config = create_vllm_config(role=ROLE)
-    from vllm.v1.attention.backends.rocm_aiter_fa import AiterFlashAttentionBackend
-
-    backend_cls = AiterFlashAttentionBackend
-
-    # Create test kv cache tensors using proper backend shape
-    kv_cache_shape = backend_cls.get_kv_cache_shape(
-        num_blocks=2, block_size=16, num_kv_heads=4, head_size=64
+    # Create test kv cache tensors using KVCacheSpec layout
+    shape = compute_layer_kv_cache_shape_bytes(
+        FullAttentionSpec(
+            block_size=16, num_kv_heads=4, head_size=64, dtype=torch.float16
+        ),
+        2,
     )
-    shared_tensor = torch.zeros(*kv_cache_shape, dtype=torch.float16)
-    unique_tensor = torch.zeros(*kv_cache_shape, dtype=torch.float16)
+    shared_tensor = torch.zeros(*shape, dtype=torch.int8).view(torch.float16)
+    unique_tensor = torch.zeros(*shape, dtype=torch.int8).view(torch.float16)
     kv_caches = {
         "layer0": shared_tensor,
         "layer1": unique_tensor,
@@ -689,3 +749,122 @@ def test_resolve_host_ip_prefers_extra_config():
     fallback = get_ip()
     assert resolve_host_ip({}) == fallback
     assert resolve_host_ip({"host_ip": ""}) == fallback
+
+
+def test_write_mode_excludes_spec_lookahead_blocks():
+    # WRITE producer save path with speculative decoding enabled must record
+    # only the prompt blocks: the trailing lookahead blocks (that decode never
+    # allocates) are clamped off via ceil(num_prompt_tokens / block_size) before
+    # the local_block_ids are recorded into MoRIIOConnectorMetadata.reqs_to_save.
+    set_role(ROLE.PRODUCER)
+    scheduler = _write_producer_scheduler(block_size=1)
+
+    req_id = "req-spec"
+    prompt_blocks = [10, 11, 12, 13, 14, 15, 16, 17]  # 8 prompt blocks
+    lookahead_blocks = [18, 19, 20]  # trailing lookahead blocks decode never gets
+    local_block_ids = prompt_blocks + lookahead_blocks
+
+    # block_size=1: num_prompt_tokens == number of prompt blocks. The full
+    # (only) chunk holds prompt + lookahead.
+    req = SimpleNamespace(
+        request_id=req_id,
+        num_prompt_tokens=len(prompt_blocks),
+        kv_transfer_params=_spec_kv_params(),
+    )
+    scheduler._reqs_need_save[req_id] = (req, local_block_ids)
+    scheduler._req_kv_params[req_id] = _spec_kv_params()
+
+    meta = _build_meta(scheduler)
+
+    assert isinstance(meta, MoRIIOConnectorMetadata)
+    assert req_id in meta.reqs_to_save
+    assert meta.reqs_to_save[req_id].local_block_ids == prompt_blocks
+
+
+def test_write_mode_chunked_prefill_clamps_spec_lookahead_blocks():
+    # Chunked-prefill + spec variant: earlier (non-final) chunks are buffered in
+    # _reqs_need_pending_save untouched; the trailing lookahead blocks are only
+    # clamped on the final-chunk save where the full local set is assembled.
+    set_role(ROLE.PRODUCER)
+    scheduler = _write_producer_scheduler(block_size=1)
+
+    req_id = "req-spec-chunked"
+    num_prompt_tokens = 8  # block_size=1 => 8 prompt blocks
+    first_chunk = [10, 11, 12, 13]  # non-final chunk, no lookahead yet
+    # final chunk carries the remaining prompt blocks + trailing lookahead
+    final_chunk = [14, 15, 16, 17, 18, 19, 20]  # 4 prompt + 3 lookahead
+    prompt_blocks = [10, 11, 12, 13, 14, 15, 16, 17]
+
+    req = SimpleNamespace(
+        request_id=req_id,
+        num_prompt_tokens=num_prompt_tokens,
+        kv_transfer_params=_spec_kv_params(),
+    )
+
+    # Step 1: first (non-final) chunk arrives via _reqs_need_save. It must be
+    # buffered into _reqs_need_pending_save and NOT saved/clamped yet.
+    scheduler._reqs_need_save[req_id] = (req, first_chunk)
+    scheduler._req_kv_params[req_id] = _spec_kv_params()
+    meta_step1 = _build_meta(scheduler)
+    assert req_id not in meta_step1.reqs_to_save
+    assert req_id in scheduler._reqs_need_pending_save
+    assert scheduler._reqs_need_pending_save[req_id][1] == first_chunk
+
+    # Step 2: final chunk arrives via scheduled_cached_reqs. The full local set
+    # (first_chunk + final_chunk incl. lookahead) is assembled, the trailing
+    # lookahead blocks clamped off, and only the prompt blocks recorded.
+    meta_step2 = _build_meta(
+        scheduler,
+        req_ids=[req_id],
+        new_block_ids=[[final_chunk]],
+    )
+    assert req_id in meta_step2.reqs_to_save
+    assert meta_step2.reqs_to_save[req_id].local_block_ids == prompt_blocks
+    assert req_id not in scheduler._reqs_need_pending_save
+
+
+@pytest.mark.parametrize(
+    ("block_size", "num_prompt_tokens", "num_prompt_blocks"),
+    [
+        # block_size=4: exact multiple (2 full blocks) and non-multiple (3 blocks,
+        # last one partial).
+        pytest.param(4, 8, 2, id="bs4-exact-multiple"),
+        pytest.param(4, 9, 3, id="bs4-non-multiple"),
+        # block_size=16: exact multiple (2 full blocks) and non-multiple (3
+        # blocks, last one partial).
+        pytest.param(16, 32, 2, id="bs16-exact-multiple"),
+        pytest.param(16, 40, 3, id="bs16-non-multiple"),
+    ],
+)
+def test_write_mode_clamps_prompt_blocks_with_block_size_gt_1(
+    block_size, num_prompt_tokens, num_prompt_blocks
+):
+    # Key coverage for the block-size-agnostic clamp: with block_size > 1 the
+    # producer's local_block_ids cover ceil(num_prompt_tokens / block_size)
+    # prompt blocks plus a trailing lookahead block. The clamp must keep exactly
+    # the prompt blocks and drop the tail. The old drop-trailing-N-spec-tokens
+    # logic would have over-dropped here, since one lookahead block spans
+    # multiple speculative tokens once block_size > 1.
+    set_role(ROLE.PRODUCER)
+    scheduler = _write_producer_scheduler(block_size=block_size)
+
+    req_id = f"req-bs{block_size}-{num_prompt_tokens}"
+    prompt_blocks = list(range(10, 10 + num_prompt_blocks))
+    lookahead_blocks = [10 + num_prompt_blocks]  # one trailing lookahead block
+    local_block_ids = prompt_blocks + lookahead_blocks
+
+    req = SimpleNamespace(
+        request_id=req_id,
+        num_prompt_tokens=num_prompt_tokens,
+        kv_transfer_params=_spec_kv_params(),
+    )
+    scheduler._reqs_need_save[req_id] = (req, local_block_ids)
+    scheduler._req_kv_params[req_id] = _spec_kv_params()
+
+    meta = _build_meta(scheduler)
+
+    assert isinstance(meta, MoRIIOConnectorMetadata)
+    assert req_id in meta.reqs_to_save
+    # Exactly ceil(num_prompt_tokens / block_size) leading blocks are kept.
+    assert len(prompt_blocks) == num_prompt_blocks
+    assert meta.reqs_to_save[req_id].local_block_ids == prompt_blocks
