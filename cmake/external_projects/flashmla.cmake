@@ -19,7 +19,7 @@ else()
   FetchContent_Declare(
         flashmla
         GIT_REPOSITORY https://github.com/vllm-project/FlashMLA
-        GIT_TAG a8f794d1251cbfd88a5011445dd5582289c727e4
+        GIT_TAG 6bc49418c5ead572ff0339191ddf3b155749e183
         GIT_PROGRESS TRUE
         CONFIGURE_COMMAND ""
         BUILD_COMMAND ""
@@ -60,6 +60,9 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
     # CUDA 12.9 has introduced "Family-Specific Architecture Features"
     # this supports all compute_10x family
     list(APPEND SUPPORT_ARCHS "10.0f")
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.4)
+        list(APPEND SUPPORT_ARCHS "10.7f")
+    endif()
 elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
     list(APPEND SUPPORT_ARCHS "10.0a")
 endif()
@@ -108,6 +111,7 @@ if(FLASH_MLA_ARCHS)
         # sm100 sparse decode
         ${flashmla_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/v32.cu
         ${flashmla_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/model1.cu
+        ${flashmla_SOURCE_DIR}/csrc/sm100/decode/head64/instantiations/v32_nvfp4_fp8rope.cu
         ${flashmla_SOURCE_DIR}/csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu
     )
 
@@ -182,10 +186,18 @@ if(FLASH_MLA_ARCHS)
     if(VLLM_GPU_LANG STREQUAL "CUDA")
         target_compile_definitions(_flashmla_extension_C PRIVATE USE_CUDA)
     endif()
+
+    # FlashMLA's sources use M_LOG2E from <cmath>. MSVC's UCRT only defines the
+    # M_* constants when _USE_MATH_DEFINES is set before <cmath> is first
+    # included, so define it for both targets on MSVC. Scoped to MSVC so the
+    # compile flags (and build caches) on other platforms stay unchanged.
+    if(MSVC)
+        target_compile_definitions(_flashmla_C PRIVATE _USE_MATH_DEFINES)
+        target_compile_definitions(_flashmla_extension_C PRIVATE _USE_MATH_DEFINES)
+    endif()
 else()
     message(STATUS "FlashMLA will not compile: unsupported CUDA architecture ${CUDA_ARCHS}")
     # Create empty targets for setup.py on unsupported systems
     add_custom_target(_flashmla_C)
     add_custom_target(_flashmla_extension_C)
 endif()
-
